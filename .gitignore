@@ -1,4 +1,4 @@
 .env
 briefs/
 __pycache__/
-*.pyc
+*.pyc.env 
