@@ -15,30 +15,22 @@ st.markdown("Enter a pharmaceutical company name to generate a structured resear
 
 with st.sidebar:
     st.header("⚙️ API Keys")
-    groq_api_key = st.text_input(
-        "Groq API Key",
-        type="password",
-        help="Free at console.groq.com"
-    )
-    tavily_api_key = st.text_input(
-        "Tavily API Key",
-        type="password",
-        help="Free at app.tavily.com (1000 searches/month)"
-    )
+    groq_api_key   = st.text_input("Groq API Key",   type="password", help="Free at console.groq.com")
+    tavily_api_key = st.text_input("Tavily API Key", type="password", help="Free at app.tavily.com (1000/month)")
+    serper_api_key = st.text_input("Serper API Key", type="password", help="Free at serper.dev (2500/month)")
     st.markdown("---")
-    st.markdown("**How it works:**")
+    st.markdown("**Pipeline:**")
     st.markdown(
-        "1. Tavily searches the web for each section separately\n"
-        "2. Groq extracts structured data from real results\n"
-        "3. No hallucination — answers grounded in live web data"
+        "1. Serper (Google) — precise facts, revenue, employees\n"
+        "2. Tavily (full pages) — pipeline, deals, MedTech detail\n"
+        "3. LLaMA 8B — compress raw content to key facts\n"
+        "4. LLaMA 70B — extract structured JSON (3 calls)"
     )
     st.markdown("---")
     st.markdown("**Output sections:**")
     st.markdown(
-        "- Key facts\n"
-        "- Business description\n"
-        "- Therapeutic areas\n"
-        "- Subsidiaries\n"
+        "- Key facts · Business description\n"
+        "- Therapeutic areas · Subsidiaries\n"
         "- Revenue chart (last 3 yrs)\n"
         "- Blockbuster drugs (last 5 yrs)\n"
         "- Pipeline & approvals (last 5 yrs)\n"
@@ -50,24 +42,24 @@ with st.sidebar:
 company_name = st.text_input("🏢 Company Name", placeholder="e.g. Roche, Pfizer, Novartis, AstraZeneca...")
 
 if st.button("🔍 Research Company", use_container_width=True):
-    if not groq_api_key:
-        st.error("Please enter your Groq API key in the sidebar.")
-    elif not tavily_api_key:
-        st.error("Please enter your Tavily API key in the sidebar.")
+    missing = [name for name, key in [("Groq", groq_api_key), ("Tavily", tavily_api_key), ("Serper", serper_api_key)] if not key]
+    if missing:
+        st.error(f"Please enter API key(s) for: {', '.join(missing)}")
     elif not company_name.strip():
         st.error("Please enter a company name.")
     else:
-        with st.spinner(f"Researching {company_name}... Running 7 web searches + AI extraction (~60s)"):
+        with st.spinner(f"Researching {company_name}... (~90 seconds)"):
             try:
-                os.environ["GROQ_API_KEY"] = groq_api_key
+                os.environ["GROQ_API_KEY"]   = groq_api_key
                 os.environ["TAVILY_API_KEY"] = tavily_api_key
+                os.environ["SERPER_API_KEY"] = serper_api_key
 
-                progress = st.progress(0, text="Starting web searches...")
+                progress = st.progress(0, text="Starting 10 web searches...")
 
-                progress.progress(10, text="Searching: Company overview & key facts...")
+                progress.progress(5,  text="Searching: key facts, revenue, pipeline, deals...")
                 data = research_company(company_name.strip())
 
-                progress.progress(80, text="Generating revenue chart...")
+                progress.progress(85, text="Generating revenue chart...")
                 chart_path = generate_revenue_chart(data, company_name.strip())
 
                 progress.progress(95, text="Formatting output brief...")
@@ -101,11 +93,12 @@ if st.button("🔍 Research Company", use_container_width=True):
 
                 if chart_path and os.path.exists(chart_path):
                     with st.expander("📊 Preview Revenue Chart", expanded=True):
-                        st.image(chart_path, caption=f"{company_name} — Revenue (USD Billions)", use_container_width=True)
+                        st.image(chart_path, caption=f"{company_name} — Revenue (USD Billions)",
+                                 use_container_width=True)
 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
                 st.exception(e)
 
 st.markdown("---")
-st.caption("Powered by Tavily Search + Groq LLaMA 3.3 · TCS Research Tool Prototype")
+st.caption("Powered by Serper · Tavily · Groq LLaMA · TCS Research Tool Prototype")

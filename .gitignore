@@ -1,0 +1,4 @@
+.env
+briefs/
+__pycache__/
+*.pyc

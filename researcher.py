@@ -1,275 +1,353 @@
 """
 researcher.py
 
-Pipeline:
-  1. Tavily search  → get top URLs per topic
-  2. Tavily extract → fetch FULL page content from those URLs (much richer than snippets)
-  3. llama-3.1-8b-instant (fast/cheap) → compress each page to key facts only (~300 tokens)
-  4. llama-3.3-70b-versatile (smart) → structured JSON extraction from compressed facts
-  Split into 3 Groq calls to stay under 12k TPM free tier.
+Dual-search pipeline:
+  - Serper (Google results)  for precise factual queries (revenue, employees, drug dates)
+  - Tavily (full page fetch)  for rich content (pipeline, deals, MedTech)
+  - 8B model compresses raw content → dense facts
+  - 70B model extracts structured JSON (3 focused calls, under 12k TPM each)
 """
 
-import os, json, re, time
+import os, json, re, time, requests
 from groq import Groq
 from tavily import TavilyClient
 from datetime import datetime
 
 CURRENT_YEAR = datetime.now().year
-YR3 = CURRENT_YEAR - 1
-YR2 = YR3 - 1
-YR1 = YR2 - 1
+YR3 = CURRENT_YEAR - 1   # 2025
+YR2 = YR3 - 1             # 2024
+YR1 = YR2 - 1             # 2023
+
+CHF_TO_USD = 1.12  # approximate conversion
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 + 2: Search → get URLs → fetch full content
+# SEARCH HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def search_and_extract(tavily: TavilyClient, query: str, max_results: int = 3) -> str:
+def serper_search(query: str, num: int = 5) -> str:
     """
-    Search for URLs, then use Tavily extract to get full page content.
-    Falls back to snippet if extract fails.
+    Google search via Serper API.
+    Returns title + snippet + link for top results.
+    Best for: precise facts, numbers, dates — Google indexes annual reports well.
+    """
+    api_key = os.environ.get("SERPER_API_KEY")
+    if not api_key:
+        return "Serper API key not set."
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "num": num},
+            timeout=15
+        )
+        data = resp.json()
+        parts = []
+        # Answer box (often has exact number)
+        if data.get("answerBox"):
+            ab = data["answerBox"]
+            parts.append(f"[ANSWER BOX]\n{ab.get('title','')}: {ab.get('answer') or ab.get('snippet','')}")
+        # Knowledge graph
+        if data.get("knowledgeGraph"):
+            kg = data["knowledgeGraph"]
+            desc = kg.get("description","")
+            attrs = kg.get("attributes",{})
+            parts.append(f"[KNOWLEDGE GRAPH]\n{kg.get('title','')}: {desc}\n" +
+                         "\n".join(f"  {k}: {v}" for k,v in attrs.items()))
+        # Organic results
+        for r in data.get("organic", [])[:num]:
+            parts.append(f"[{r.get('title','')}]\n{r.get('snippet','')}\n{r.get('link','')}")
+        return "\n\n---\n\n".join(parts) if parts else "No results."
+    except Exception as e:
+        return f"Serper error: {str(e)}"
+
+
+def tavily_fetch(tavily: TavilyClient, query: str, max_results: int = 3) -> str:
+    """
+    Tavily with raw_content=True — fetches full page text.
+    Best for: detailed pipeline info, acquisition details, MedTech descriptions.
     """
     try:
-        # First get search results with snippets
-        search_resp = tavily.search(
-            query=query,
-            max_results=max_results,
-            search_depth="advanced",
-            include_raw_content=True   # ask for full content directly
-        )
-        results = search_resp.get("results", [])
+        resp = tavily.search(query=query, max_results=max_results,
+                             search_depth="advanced", include_raw_content=True)
         parts = []
-        for r in results:
+        for r in resp.get("results", []):
             title   = r.get("title", "")
-            # prefer raw_content (full page), fall back to content snippet
-            raw     = r.get("raw_content") or r.get("content", "")
+            content = r.get("raw_content") or r.get("content", "")
             url     = r.get("url", "")
-            # keep up to 2000 chars per page — much more than 800-char snippets
-            parts.append(f"SOURCE: {title}\nURL: {url}\n{raw[:2000]}")
+            parts.append(f"[{title}]\n{content[:1800]}\n({url})")
         return "\n\n====\n\n".join(parts) if parts else "No results."
     except Exception as e:
-        return f"Search error: {str(e)}"
+        return f"Tavily error: {str(e)}"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATHER CONTEXT  — 10 targeted searches across both APIs
+# ─────────────────────────────────────────────────────────────────────────────
 
 def gather_all_context(company: str, tavily: TavilyClient) -> dict:
-    c = company  # shorthand
+    c = company
+    print(f"  [1/10] Serper: key facts (employees, founded, HQ)...")
+    ctx_facts = serper_search(
+        f"{c} pharmaceutical company employees headquarters founded parent CEO 2025", 6)
 
-    print(f"  [1/7] Overview & key facts...")
-    ctx_overview = search_and_extract(tavily,
-        f"{c} pharmaceutical annual report 2025 overview CEO employees headquarters founded", 3)
+    print(f"  [2/10] Serper: revenue {YR1} {YR2} {YR3}...")
+    ctx_revenue = serper_search(
+        f"{c} annual revenue {YR1} {YR2} {YR3} CHF USD billions full year results", 6)
 
-    print(f"  [2/7] Revenue (CHF/USD)...")
-    ctx_revenue = search_and_extract(tavily,
-        f"{c} full year results {YR1} {YR2} {YR3} revenue sales CHF USD billions", 4)
+    print(f"  [3/10] Serper: revenue cross-check...")
+    ctx_revenue2 = serper_search(
+        f"{c} {YR3} full year sales results financial highlights CHF billion", 5)
 
-    print(f"  [3/7] Therapeutic areas & subsidiaries...")
-    ctx_therapeutic = search_and_extract(tavily,
-        f"{c} therapeutic areas disease areas portfolio oncology neurology diagnostics subsidiaries", 3)
+    print(f"  [4/10] Serper: subsidiaries & therapeutic areas...")
+    ctx_biz = serper_search(
+        f"{c} subsidiaries therapeutic areas disease areas business segments 2024 2025", 5)
 
-    print(f"  [4/7] Blockbuster drugs...")
-    ctx_blockbuster = search_and_extract(tavily,
-        f"{c} blockbuster drug sales 2021 2022 2023 2024 2025 billion revenue indication launched", 4)
+    print(f"  [5/10] Serper: blockbuster drugs launch year sales...")
+    ctx_blockbuster = serper_search(
+        f"{c} blockbuster drugs billion sales 2021 2022 2023 2024 2025 launch year approval indication", 6)
 
-    print(f"  [5/7] Pipeline & approvals...")
-    ctx_pipeline = search_and_extract(tavily,
-        f"{c} FDA EMA drug approval pipeline 2021 2022 2023 2024 2025 2026 phase III filed approved", 4)
+    print(f"  [6/10] Tavily: blockbuster drugs detail...")
+    ctx_blockbuster2 = tavily_fetch(tavily,
+        f"{c} new drugs launched 2021 2022 2023 2024 sales exceed 1 billion indication approval year", 3)
 
-    print(f"  [6/7] Acquisitions...")
-    ctx_acq = search_and_extract(tavily,
-        f"{c} acquisition acquired {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} deal billion", 3)
+    print(f"  [7/10] Tavily: pipeline & approvals...")
+    ctx_pipeline = tavily_fetch(tavily,
+        f"{c} drug pipeline FDA EMA approval 2021 2022 2023 2024 2025 2026 phase III filed approved", 4)
 
-    print(f"  [7/7] Partnerships & MedTech...")
-    ctx_partner = search_and_extract(tavily,
-        f"{c} partnership collaboration AI diagnostics medtech {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR}", 3)
+    print(f"  [8/10] Serper: acquisitions last 2 years...")
+    ctx_acq = serper_search(
+        f"{c} acquisition acquired {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} deal billion", 6)
+
+    print(f"  [9/10] Tavily: acquisitions detail...")
+    ctx_acq2 = tavily_fetch(tavily,
+        f"{c} acquisition deal {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} billion purpose", 3)
+
+    print(f"  [10/10] Tavily: partnerships & MedTech...")
+    ctx_partner = tavily_fetch(tavily,
+        f"{c} partnership collaboration AI diagnostics medtech {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR}", 4)
 
     return {
-        "overview":    ctx_overview,
-        "revenue":     ctx_revenue,
-        "therapeutic": ctx_therapeutic,
-        "blockbuster": ctx_blockbuster,
-        "pipeline":    ctx_pipeline,
-        "acquisitions":ctx_acq,
-        "partnerships":ctx_partner,
+        "facts":        ctx_facts,
+        "revenue":      ctx_revenue,
+        "revenue2":     ctx_revenue2,
+        "biz":          ctx_biz,
+        "blockbuster":  ctx_blockbuster,
+        "blockbuster2": ctx_blockbuster2,
+        "pipeline":     ctx_pipeline,
+        "acquisitions": ctx_acq,
+        "acquisitions2":ctx_acq2,
+        "partnerships": ctx_partner,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3: Compress each context block using fast small model
+# COMPRESS — 8B model strips noise, keeps only needed facts
 # ─────────────────────────────────────────────────────────────────────────────
 
-COMPRESS_SYSTEM = (
-    "You are a data extraction assistant. Read the text and extract ONLY the specific "
-    "facts asked for. Be concise. Numbers, names, dates must be exact. No commentary."
+COMPRESS_SYS = (
+    "You are a precise data extraction assistant. "
+    "Read the text and extract ONLY the specific facts requested. "
+    "Be concise. Preserve exact numbers, names, dates, currency labels. No commentary."
 )
 
-def compress(client: Groq, text: str, instructions: str, max_tokens: int = 400) -> str:
-    """Use llama-3.1-8b-instant to compress raw page text into key facts."""
+def compress(client: Groq, text: str, instructions: str, max_tokens: int = 450) -> str:
     try:
         resp = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": COMPRESS_SYSTEM},
-                {"role": "user",   "content": f"{instructions}\n\nTEXT:\n{text[:6000]}"}
+                {"role": "system", "content": COMPRESS_SYS},
+                {"role": "user",   "content": f"{instructions}\n\nSOURCE TEXT:\n{text[:5000]}"}
             ],
             temperature=0.0,
             max_tokens=max_tokens,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        # If rate limited, wait and return truncated original
         if "rate_limit" in str(e).lower():
-            time.sleep(3)
-            return text[:800]
-        return text[:800]
+            time.sleep(4)
+            return text[:600]
+        return text[:600]
 
 
 def compress_all(client: Groq, company: str, ctx: dict) -> dict:
-    """Compress all 7 context blocks into dense fact summaries."""
-    print("  [compress 1/5] Overview & employees...")
-    c_overview = compress(client, ctx["overview"],
-        f"Extract for {company}: full company name, year founded, headquarters city/country, "
-        f"number of employees, CEO name, other key executives with titles, "
-        f"number of countries operating in, core business segments.")
+    c = company
 
-    print("  [compress 2/5] Revenue...")
-    c_revenue = compress(client, ctx["revenue"],
-        f"Extract for {company}: exact annual revenue figures for {YR1}, {YR2}, {YR3}. "
-        f"State currency (CHF or USD). Include any USD conversion if mentioned. "
-        f"List as: YEAR: VALUE CURRENCY. Do not skip any year found.")
+    print("  [compress 1/6] Key facts...")
+    c_facts = compress(client,
+        ctx["facts"],
+        f"From this text about {c}, extract:\n"
+        f"- Full official company name\n- Year founded\n- Headquarters (city, country)\n"
+        f"- Exact number of employees (look for headcount figures like 103,000 etc)\n"
+        f"- Parent organization\n- Industry classification\n"
+        f"- All named executives with their EXACT titles\n"
+        f"- How many countries {c} operates in")
 
-    print("  [compress 3/5] Therapeutic areas...")
-    c_therapeutic = compress(client, ctx["therapeutic"],
-        f"Extract for {company}: list ALL therapeutic/disease areas and subsidiaries mentioned.")
+    print("  [compress 2/6] Revenue...")
+    c_revenue = compress(client,
+        ctx["revenue"] + "\n\n" + ctx["revenue2"],
+        f"From this text about {c}, extract:\n"
+        f"- Revenue/sales for fiscal years {YR1}, {YR2}, {YR3}\n"
+        f"- State the EXACT figure AND the currency (CHF or USD)\n"
+        f"- If in CHF: also compute USD equivalent (CHF × {CHF_TO_USD})\n"
+        f"- Any mentioned CAGR figures\n"
+        f"Format: YEAR: [value] [currency] / USD equiv: [computed]",
+        max_tokens=300)
 
-    print("  [compress 4/5] Blockbuster drugs...")
-    c_blockbuster = compress(client, ctx["blockbuster"],
-        f"Extract for {company}: drugs launched 2021–{CURRENT_YEAR} that reached >$1B annual sales. "
-        f"For each: drug name, exact launch/approval year, disease/indication, annual sales figure. "
-        f"Only include if launch year AND disease AND sales figure are all present.")
+    print("  [compress 3/6] Business segments, therapeutic areas, subsidiaries...")
+    c_biz = compress(client,
+        ctx["biz"],
+        f"From this text about {c}, extract:\n"
+        f"- All subsidiaries mentioned (e.g. Genentech, Chugai, etc.)\n"
+        f"- All therapeutic/disease areas listed\n"
+        f"- Core business segments\n"
+        f"- Brief description of scientific approach or differentiator")
 
-    print("  [compress 5/5] Pipeline, deals, MedTech...")
-    c_pipeline = compress(client, ctx["pipeline"],
-        f"Extract for {company}: drug pipeline events 2021–{CURRENT_YEAR}. "
-        f"For each: drug name, status (Phase III/Filed/Approved), year, exact indication.")
+    print("  [compress 4/6] Blockbuster drugs...")
+    c_blockbuster = compress(client,
+        ctx["blockbuster"] + "\n\n" + ctx["blockbuster2"],
+        f"From this text about {c}, list drugs that:\n"
+        f"1. Were launched/approved between 2021 and {CURRENT_YEAR}\n"
+        f"2. Have confirmed annual sales exceeding $1 billion\n"
+        f"For each drug include: brand name, EXACT launch/approval year, "
+        f"disease/indication, annual sales figure, any abbreviation.\n"
+        f"ONLY include if you find all three: name + year + disease. Skip if year is missing.",
+        max_tokens=500)
 
-    c_acq = compress(client, ctx["acquisitions"],
-        f"Extract for {company}: acquisitions {CURRENT_YEAR-2}–{CURRENT_YEAR}. "
-        f"For each: company name, month+year of deal, deal value in USD, what was acquired.")
+    print("  [compress 5/6] Pipeline...")
+    c_pipeline = compress(client,
+        ctx["pipeline"],
+        f"From this text about {c}, list drug pipeline events from 2021–{CURRENT_YEAR}:\n"
+        f"For each: drug name, status (Phase III/Filed/Approved), year, full indication.\n"
+        f"Focus on most important/recent approvals and late-stage drugs.",
+        max_tokens=500)
 
-    c_partner = compress(client, ctx["partnerships"],
-        f"Extract for {company}: partnerships and MedTech/AI/diagnostics initiatives "
-        f"{CURRENT_YEAR-2}–{CURRENT_YEAR}. For each: partner name, date, value, focus area.")
+    print("  [compress 6/6] Acquisitions & partnerships...")
+    c_deals = compress(client,
+        ctx["acquisitions"] + "\n\n" + ctx["acquisitions2"] + "\n\n" + ctx["partnerships"],
+        f"From this text about {c}, extract:\n"
+        f"ACQUISITIONS (only {CURRENT_YEAR-2}–{CURRENT_YEAR}):\n"
+        f"  - Company acquired, month+year, deal value in USD, what was acquired/why\n"
+        f"PARTNERSHIPS (only {CURRENT_YEAR-2}–{CURRENT_YEAR}):\n"
+        f"  - Partner name, month+year, value, focus area\n"
+        f"MEDTECH/AI/INNOVATION ({CURRENT_YEAR-5}–{CURRENT_YEAR}):\n"
+        f"  - Initiative name, year, one-sentence description\n"
+        f"Label each section clearly. Exclude anything before {CURRENT_YEAR-2} for acq/partnerships.",
+        max_tokens=600)
 
     return {
-        "overview":     c_overview,
-        "revenue":      c_revenue,
-        "therapeutic":  c_therapeutic,
-        "blockbuster":  c_blockbuster,
-        "pipeline":     c_pipeline,
-        "acquisitions": c_acq,
-        "partnerships": c_partner,
+        "facts":      c_facts,
+        "revenue":    c_revenue,
+        "biz":        c_biz,
+        "blockbuster":c_blockbuster,
+        "pipeline":   c_pipeline,
+        "deals":      c_deals,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4: Structured JSON extraction using 70B model
+# EXTRACT — 70B model turns compressed facts into structured JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
-EXTRACT_SYSTEM = (
+EXTRACT_SYS = (
     "You are a pharmaceutical research analyst. "
-    "Extract structured data ONLY from the compressed facts provided. "
-    "Do NOT invent or guess. Use null or [] when data is absent. "
-    "Return ONLY valid compact JSON — no markdown fences, no explanation."
+    "Convert the provided compressed facts into the exact JSON structure requested. "
+    "Use ONLY what is stated in the facts. Use null or [] when absent. "
+    "Return ONLY valid compact JSON — no markdown, no explanation."
 )
 
-CHF_NOTE = f"Note: If revenue is in CHF, multiply by 1.12 to get USD. Roche reports in CHF."
+def prompt1(company, c):
+    return f"""Build the company profile JSON for "{company}" from these facts.
 
-def prompt_call1(company, c):
-    return f"""Extract profile and revenue data for "{company}".
+FACTS — KEY INFO:
+{c['facts']}
 
-FACTS:
-Overview: {c['overview']}
-Revenue: {c['revenue']}
-Therapeutic/Subsidiaries: {c['therapeutic']}
+FACTS — REVENUE:
+{c['revenue']}
 
-{CHF_NOTE}
+FACTS — BUSINESS / SUBSIDIARIES / THERAPEUTIC AREAS:
+{c['biz']}
 
-Return ONLY this JSON:
+CHF→USD conversion: multiply CHF value by {CHF_TO_USD}
+
+Return ONLY:
 {{
   "company_name": "Full official name",
-  "founded": "Year only e.g. 1896",
-  "parent_organization": "Parent or Independent",
+  "founded": "Year e.g. 1896",
+  "parent_organization": "Parent company or Independent",
   "headquarters": "City, Country",
-  "num_employees": "e.g. ~103,000",
+  "num_employees": "Exact or approximate e.g. 103,249 or ~103,000",
   "industry": "e.g. Pharmaceuticals / Diagnostics",
   "key_people": [{{"name": "Full Name", "role": "Exact title"}}],
-  "business_description": "2-3 sentences: number of countries present in, two core business segments, one distinguishing scientific fact. No drug names, no revenue, no subsidiaries.",
-  "therapeutic_areas": ["every area explicitly mentioned"],
-  "subsidiaries": ["every subsidiary explicitly mentioned"],
+  "business_description": "2-3 sentences covering: (1) number of countries {company} operates in, (2) its two core business segments, (3) one distinguishing fact about its scientific/research approach. Do NOT mention drug names, revenue figures, or subsidiary names.",
+  "therapeutic_areas": ["every area explicitly mentioned in facts"],
+  "subsidiaries": ["every subsidiary explicitly mentioned — e.g. Genentech, Chugai Pharmaceutical, Ventana Medical Systems, Foundation Medicine"],
   "revenue_usd_billions": {{"{YR1}": null, "{YR2}": null, "{YR3}": null}},
   "revenue_cagr_3yr_pct": null
 }}
-Rules: revenue years must be {YR1}, {YR2}, {YR3} only. Convert CHF→USD (×1.12). null if not found.
+Revenue rules: use years {YR1}, {YR2}, {YR3} only. Values must be in USD billions (convert CHF×{CHF_TO_USD} if needed). null if not found.
 Return ONLY JSON."""
 
 
-def prompt_call2(company, c):
+def prompt2(company, c):
     yr5 = CURRENT_YEAR - 5
-    return f"""Extract drug data for "{company}".
+    return f"""Build the drugs JSON for "{company}" from these facts.
 
-FACTS:
-Blockbuster Drugs: {c['blockbuster']}
-Pipeline & Approvals: {c['pipeline']}
+FACTS — BLOCKBUSTER DRUGS:
+{c['blockbuster']}
 
-Return ONLY this JSON:
+FACTS — PIPELINE & APPROVALS:
+{c['pipeline']}
+
+Return ONLY:
 {{
   "blockbuster_drugs_last_5yr": [
-    {{"drug_name": "Brand name", "year_launched": 2022, "disease_area": "Full indication", "abbreviation": "short form or null"}}
+    {{"drug_name": "Brand name", "year_launched": 2022, "disease_area": "Full indication name", "abbreviation": "short form or null"}}
   ],
   "pipeline_approvals_last_5yr": [
     {{"drug_name": "Name", "status": "Phase III/Filed/Approved", "year": 2024, "indication": "Full disease name"}}
   ]
 }}
 Rules:
-- blockbuster: ONLY {yr5}–{CURRENT_YEAR}, must have year_launched + disease_area + confirmed >$1B sales. Omit if any of these missing.
-- pipeline: only {yr5}–{CURRENT_YEAR} events.
+- blockbuster: ONLY drugs with ALL THREE present: launch year {yr5}–{CURRENT_YEAR}, disease area, confirmed >$1B sales. Omit entire entry if any field missing.
+- pipeline: only events {yr5}–{CURRENT_YEAR}. Prioritise approved drugs and phase III.
 Return ONLY JSON."""
 
 
-def prompt_call3(company, c):
+def prompt3(company, c):
     yr5 = CURRENT_YEAR - 5
     yr2 = CURRENT_YEAR - 2
-    return f"""Extract deals and innovation data for "{company}".
+    return f"""Build the deals and innovation JSON for "{company}" from these facts.
 
 FACTS:
-Acquisitions: {c['acquisitions']}
-Partnerships & MedTech: {c['partnerships']}
+{c['deals']}
 
-Return ONLY this JSON:
+Return ONLY:
 {{
   "medtech_innovation_last_5yr": [
-    {{"initiative": "Short title", "year": 2023, "description": "One clear sentence"}}
+    {{"initiative": "Short descriptive title", "year": 2024, "description": "One clear sentence"}}
   ],
   "acquisitions_last_2yr": [
-    {{"company": "Name", "date": "Month Year", "value_usd": "~$X.XB or undisclosed", "purpose": "What was acquired"}}
+    {{"company": "Acquired company name", "date": "Month Year", "value_usd": "~$X.XB or undisclosed", "purpose": "What capability/asset was acquired"}}
   ],
   "partnerships_last_2yr": [
-    {{"partner": "Name", "date": "Month Year", "value_usd": "~$XB or undisclosed", "focus": "What it covers"}}
+    {{"partner": "Partner name", "date": "Month Year", "value_usd": "~$XB or undisclosed", "focus": "What the partnership covers"}}
   ]
 }}
 Rules:
-- medtech: {yr5}–{CURRENT_YEAR} only.
-- acquisitions: STRICTLY {yr2}–{CURRENT_YEAR} only. Exclude anything before {yr2}.
-- partnerships: STRICTLY {yr2}–{CURRENT_YEAR} only. Exclude anything before {yr2}.
+- medtech: {yr5}–{CURRENT_YEAR}, AI/diagnostics/digital health only.
+- acquisitions: STRICTLY {yr2}–{CURRENT_YEAR} only. Hard exclude anything before {yr2}.
+- partnerships: STRICTLY {yr2}–{CURRENT_YEAR} only. Hard exclude anything before {yr2}.
+- Do NOT duplicate entries. Each company/partner appears only once.
 Return ONLY JSON."""
 
 
-def call_groq_extract(client: Groq, prompt: str, label: str) -> dict:
+def call_groq(client: Groq, prompt: str, label: str) -> dict:
     print(f"[researcher] Groq extract {label}...")
     resp = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": EXTRACT_SYSTEM},
+            {"role": "system", "content": EXTRACT_SYS},
             {"role": "user",   "content": prompt}
         ],
         temperature=0.05,
@@ -292,32 +370,30 @@ def call_groq_extract(client: Groq, prompt: str, label: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def research_company(company: str) -> dict:
-    groq_key   = os.environ.get("GROQ_API_KEY")
-    tavily_key = os.environ.get("TAVILY_API_KEY")
-    if not groq_key:   raise ValueError("GROQ_API_KEY not set")
-    if not tavily_key: raise ValueError("TAVILY_API_KEY not set")
+    for key, name in [("GROQ_API_KEY","Groq"), ("TAVILY_API_KEY","Tavily"), ("SERPER_API_KEY","Serper")]:
+        if not os.environ.get(key):
+            raise ValueError(f"{name} API key not set ({key})")
 
-    tavily      = TavilyClient(api_key=tavily_key)
-    groq_client = Groq(api_key=groq_key)
+    tavily      = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # ── 1. Fetch full page content via Tavily ──────────────────────────────
-    print(f"\n[researcher] Fetching web content for: {company}")
+    # 1. 10 targeted searches (Serper + Tavily)
+    print(f"\n[researcher] Searching for: {company}")
     ctx = gather_all_context(company, tavily)
 
-    # ── 2. Compress each block to dense facts (fast 8B model) ─────────────
-    print(f"\n[researcher] Compressing content...")
+    # 2. Compress raw content → dense facts (8B model)
+    print(f"\n[researcher] Compressing...")
     compressed = compress_all(groq_client, company, ctx)
 
-    # ── 3. Extract structured JSON (smart 70B model, 3 calls) ─────────────
+    # 3. Extract structured JSON (70B model, 3 calls)
     print(f"\n[researcher] Extracting structured data...")
-    d1 = call_groq_extract(groq_client, prompt_call1(company, compressed), "1/3: profile+revenue")
-    d2 = call_groq_extract(groq_client, prompt_call2(company, compressed), "2/3: drugs+pipeline")
-    d3 = call_groq_extract(groq_client, prompt_call3(company, compressed), "3/3: deals+medtech")
+    d1 = call_groq(groq_client, prompt1(company, compressed), "1/3: profile+revenue")
+    d2 = call_groq(groq_client, prompt2(company, compressed), "2/3: drugs+pipeline")
+    d3 = call_groq(groq_client, prompt3(company, compressed), "3/3: deals+medtech")
 
-    # ── 4. Merge ───────────────────────────────────────────────────────────
     data = {**d1, **d2, **d3}
 
-    # ── 5. Auto-calculate CAGR ─────────────────────────────────────────────
+    # 4. Auto-calculate CAGR if missing
     rev = data.get("revenue_usd_billions", {})
     rev_valid = {k: float(v) for k, v in rev.items() if v is not None}
     if len(rev_valid) >= 2 and not data.get("revenue_cagr_3yr_pct"):
