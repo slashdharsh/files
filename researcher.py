@@ -86,56 +86,60 @@ def gather_all_context(company: str, tavily: TavilyClient) -> dict:
     print(f"  [2] Parent organization...")
     ctx_parent = serper(f"{c} parent organization holding company owner", 4)
 
-    print(f"  [3] Revenue {YR1} {YR2} {YR3} CHF...")
-    ctx_rev1 = serper(f"{c} full year {YR3} revenue CHF billion annual results", 6)
+    print(f"  [3] Key executives — full names and titles...")
+    ctx_people = serper(
+        f"{c} executive leadership Thomas Schinecker Severin Schwan Levi Garraway Alan Hippe Wafaa Mamilli CEO CFO CMO 2024 2025", 6)
 
-    print(f"  [4] Revenue cross-check USD...")
-    ctx_rev2 = serper(f"{c} annual revenue {YR1} {YR2} {YR3} USD billions financial results", 6)
+    print(f"  [4] Key people detail page...")
+    ctx_people2 = tavily_fetch(tavily,
+        f"{c} executive leadership team CEO CFO CMO board full name exact title 2024 2025", 2)
 
-    print(f"  [5] Revenue investor relations page...")
-    ctx_rev3 = tavily_fetch(tavily, f"{c} investor relations annual results {YR3} revenue CHF USD sales", 2)
+    print(f"  [5] Revenue {YR3} CHF...")
+    ctx_rev1 = serper(f'\"{c}\" \"full year {YR3}\" revenue CHF billion results', 6)
 
-    print(f"  [6] Subsidiaries...")
+    print(f"  [6] Revenue {YR2} CHF...")
+    ctx_rev2 = serper(f'\"{c}\" \"full year {YR2}\" revenue CHF billion results', 6)
+
+    print(f"  [7] Revenue {YR1} CHF...")
+    ctx_rev3 = serper(f'\"{c}\" \"full year {YR1}\" revenue CHF billion results', 5)
+
+    print(f"  [8] Revenue investor relations page...")
+    ctx_rev4 = tavily_fetch(tavily,
+        f"{c} investor relations annual results {YR3} {YR2} {YR1} revenue CHF sales", 2)
+
+    print(f"  [9] Subsidiaries & therapeutic areas...")
     ctx_subs = serper(f"{c} subsidiaries Genentech Chugai Ventana Foundation Medicine list", 5)
-
-    print(f"  [7] Therapeutic areas...")
     ctx_therapeutic = serper(f"{c} therapeutic areas disease focus oncology neurology ophthalmology portfolio 2024", 5)
 
-    print(f"  [8] Blockbuster drugs — Evrysdi Vabysmo Phesgo launch year sales...")
+    print(f"  [10] Blockbuster drugs...")
     ctx_bb1 = serper(f"{c} Evrysdi Vabysmo Phesgo launch year approval FDA sales billion indication", 6)
-
-    print(f"  [9] Blockbuster drugs — top selling products...")
     ctx_bb2 = tavily_fetch(tavily, f"{c} top selling drugs 2022 2023 2024 billion dollar products blockbuster sales", 3)
 
-    print(f"  [10] Pipeline & approvals...")
+    print(f"  [11] Pipeline & approvals...")
     ctx_pipeline = tavily_fetch(tavily,
         f"{c} drug pipeline FDA EMA approval 2021 2022 2023 2024 2025 2026 phase III filed approved", 4)
 
-    print(f"  [11] Acquisitions — 89Bio, Poseida, LumiraDx, Regor...")
+    print(f"  [12] Acquisitions...")
     ctx_acq1 = serper(f"{c} 89Bio Poseida LumiraDx Regor acquisition 2024 2025 billion deal", 6)
-
-    print(f"  [12] Acquisitions — detail...")
     ctx_acq2 = tavily_fetch(tavily,
         f"{c} acquisition {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} billion deal completed strategic", 3)
 
-    print(f"  [13] Partnerships — C4 Therapeutics NVIDIA Veeva Broad Clinical Labs...")
-    ctx_part1 = serper(
-        f"{c} C4 Therapeutics NVIDIA Veeva partnership collaboration 2024 2025 2026", 6)
-
-    print(f"  [14] Partnerships — detail...")
+    print(f"  [13] Partnerships & MedTech...")
+    ctx_part1 = serper(f"{c} C4 Therapeutics NVIDIA Veeva partnership collaboration 2024 2025 2026", 6)
     ctx_part2 = tavily_fetch(tavily,
         f"{c} partnership collaboration 2024 2025 2026 AI diagnostics oncology deal signed", 3)
-
-    print(f"  [15] MedTech — NVIDIA AI factory Institute of Human Biology...")
     ctx_medtech = serper(
         f"{c} NVIDIA AI factory Institute Human Biology diagnostics digital health innovation 2024 2025 2026", 6)
 
     return {
         "facts":      ctx_facts,
         "parent":     ctx_parent,
+        "people":     ctx_people,
+        "people2":    ctx_people2,
         "rev1":       ctx_rev1,
         "rev2":       ctx_rev2,
         "rev3":       ctx_rev3,
+        "rev4":       ctx_rev4,
         "subs":       ctx_subs,
         "therapeutic":ctx_therapeutic,
         "bb1":        ctx_bb1,
@@ -185,23 +189,33 @@ def compress(client: Groq, text: str, instructions: str, max_tokens: int = 500) 
 def compress_all(client: Groq, company: str, ctx: dict) -> dict:
     c = company
 
-    print("  [compress 1/7] Key facts...")
-    c_facts = compress(client, ctx["facts"] + "\n\n" + ctx["parent"],
+    print("  [compress 1/7] Key facts + executives...")
+    people_text = (ctx["facts"] + "\n\n===\n\n" + ctx["parent"] +
+                   "\n\n===\n\n" + ctx["people"] + "\n\n===\n\n" + ctx["people2"])
+    c_facts = compress(client, people_text,
         f"From this text about {c}, extract EXACTLY:\n"
         f"1. Full official company name\n"
         f"2. Year founded\n"
         f"3. Headquarters city and country\n"
         f"4. EXACT employee headcount — look for numbers like '103,249' or '~103,000'. "
-        f"   Write the exact number you see. Do not write 'over 100,000'.\n"
-        f"5. Parent/holding company name (e.g. Roche Holding AG)\n"
+        f"Write the exact number. Do not write 'over 100,000'.\n"
+        f"5. Parent/holding company name (look for Roche Holding AG)\n"
         f"6. Industry\n"
-        f"7. All executives with exact titles\n"
-        f"8. Number of countries operated in\n"
-        f"If employee count not found, write EMPLOYEES: NOT FOUND")
+        f"7. EXECUTIVES — extract FULL first+last name AND exact job title for each person.\n"
+        f"   Known people to find: Thomas Schinecker (CEO Roche Group), Severin Schwan (Chairman), "
+        f"Alan Hippe (CFO), Levi Garraway (Chief Medical Officer & Head of Global Product Development), "
+        f"Teresa Graham (CEO Roche Pharmaceuticals), Matt Sause (CEO Roche Diagnostics), "
+        f"Wafaa Mamilli (Chief Digital and Technology Officer), "
+        f"Cristina Wilbur (Chief People Officer), Aviv Regev (Head of Genentech Research gRED), "
+        f"Claudia Bockstiegel (General Counsel), Silke Hornstein (Head of Corporate Strategy).\n"
+        f"   Format each as: FULL NAME | EXACT TITLE\n"
+        f"8. Number of countries operated in (look for 'over 100 countries' or similar)\n"
+        f"If employee count not found, write EMPLOYEES: NOT FOUND",
+        max_tokens=700)
 
     print("  [compress 2/7] Revenue...")
     c_revenue = compress(client,
-        ctx["rev1"] + "\n\n===\n\n" + ctx["rev2"] + "\n\n===\n\n" + ctx["rev3"],
+        ctx["rev1"] + "\n\n===\n\n" + ctx["rev2"] + "\n\n===\n\n" + ctx["rev3"] + "\n\n===\n\n" + ctx["rev4"],
         f"From this text about {c}, extract revenue for {YR1}, {YR2}, {YR3}.\n"
         f"Rules:\n"
         f"- State the EXACT value and currency found (CHF or USD)\n"
