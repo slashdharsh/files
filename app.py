@@ -4,6 +4,32 @@ from researcher import research_company
 from chart import generate_revenue_chart
 from formatter import format_output
 
+# ── Load API keys ──────────────────────────────────────────────────────────
+# Priority: Streamlit secrets (cloud) → .env file (local) → error
+try:
+    # Works on Streamlit Cloud
+    from dotenv import load_dotenv
+    load_dotenv()  # loads .env if present locally, no-op if not found
+except ImportError:
+    pass
+
+def get_key(name: str) -> str:
+    # 1. Streamlit secrets (for cloud deployment)
+    try:
+        return st.secrets[name]
+    except Exception:
+        pass
+    # 2. Environment variable (loaded from .env locally)
+    val = os.environ.get(name)
+    if val:
+        return val
+    return ""
+
+GROQ_KEY   = get_key("GROQ_API_KEY")
+TAVILY_KEY = get_key("TAVILY_API_KEY")
+SERPER_KEY = get_key("SERPER_API_KEY")
+
+# ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Pharma Company Research Tool",
     page_icon="💊",
@@ -13,18 +39,14 @@ st.set_page_config(
 st.title("💊 Pharma Company Research Tool")
 st.markdown("Enter a pharmaceutical company name to generate a structured research brief and revenue chart.")
 
+# ── Sidebar — info only, no key inputs ────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ API Keys")
-    groq_api_key   = st.text_input("Groq API Key",   type="password", help="Free at console.groq.com")
-    tavily_api_key = st.text_input("Tavily API Key", type="password", help="Free at app.tavily.com (1000/month)")
-    serper_api_key = st.text_input("Serper API Key", type="password", help="Free at serper.dev (2500/month)")
-    st.markdown("---")
     st.markdown("**Pipeline:**")
     st.markdown(
-        "1. Serper (Google) — precise facts, revenue, employees\n"
-        "2. Tavily (full pages) — pipeline, deals, MedTech detail\n"
-        "3. LLaMA 8B — compress raw content to key facts\n"
-        "4. LLaMA 70B — extract structured JSON (3 calls)"
+        "1. Serper (Google) — facts, revenue, employees\n"
+        "2. Tavily (full pages) — pipeline, deals, MedTech\n"
+        "3. LLaMA 8B — compress to key facts\n"
+        "4. LLaMA 70B — extract structured JSON"
     )
     st.markdown("---")
     st.markdown("**Output sections:**")
@@ -39,24 +61,30 @@ with st.sidebar:
         "- Partnerships (last 2 yrs)"
     )
 
+    # Show key status
+    st.markdown("---")
+    st.markdown("**API Key Status:**")
+    for label, val in [("Groq", GROQ_KEY), ("Tavily", TAVILY_KEY), ("Serper", SERPER_KEY)]:
+        st.markdown(f"{'✅' if val else '❌'} {label}")
+
+# ── Main ───────────────────────────────────────────────────────────────────
 company_name = st.text_input("🏢 Company Name", placeholder="e.g. Roche, Pfizer, Novartis, AstraZeneca...")
 
 if st.button("🔍 Research Company", use_container_width=True):
-    missing = [name for name, key in [("Groq", groq_api_key), ("Tavily", tavily_api_key), ("Serper", serper_api_key)] if not key]
+    missing = [n for n, k in [("Groq", GROQ_KEY), ("Tavily", TAVILY_KEY), ("Serper", SERPER_KEY)] if not k]
     if missing:
-        st.error(f"Please enter API key(s) for: {', '.join(missing)}")
+        st.error(f"Missing API keys: {', '.join(missing)}. Add them to your .env file or Streamlit secrets.")
     elif not company_name.strip():
         st.error("Please enter a company name.")
     else:
         with st.spinner(f"Researching {company_name}... (~90 seconds)"):
             try:
-                os.environ["GROQ_API_KEY"]   = groq_api_key
-                os.environ["TAVILY_API_KEY"] = tavily_api_key
-                os.environ["SERPER_API_KEY"] = serper_api_key
+                os.environ["GROQ_API_KEY"]   = GROQ_KEY
+                os.environ["TAVILY_API_KEY"] = TAVILY_KEY
+                os.environ["SERPER_API_KEY"] = SERPER_KEY
 
-                progress = st.progress(0, text="Starting 10 web searches...")
-
-                progress.progress(5,  text="Searching: key facts, revenue, pipeline, deals...")
+                progress = st.progress(0, text="Starting web searches...")
+                progress.progress(5, text="Searching: key facts, revenue, pipeline, deals...")
                 data = research_company(company_name.strip())
 
                 progress.progress(85, text="Generating revenue chart...")
