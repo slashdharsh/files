@@ -2,6 +2,13 @@
 researcher.py — Generic pharma research tool.
 Works for ANY company. Zero hardcoded company names, drug names, or person names.
 Pipeline: Serper + Tavily search → 8B compress → 70B extract JSON
+
+Fixes v5:
+- Employees: dedicated annual report search + strict instruction to use annual report figure not layoff news
+- Blockbusters: 3 separate searches (top sellers, annual report product table, recently crossed $1B)
+  + compress instruction warns not to include drugs from OTHER companies
+- Subsidiaries: search for major business units not just legal entities
+- Partnerships: added filter to exclude sports/celebrity/non-pharma noise
 """
 
 import os, json, re, time, requests
@@ -60,14 +67,14 @@ def tavily_fetch(tavily: TavilyClient, query: str, max_results: int = 3) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GATHER CONTEXT — all queries use only the company variable, nothing hardcoded
+# GATHER CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gather_all_context(company: str, tavily: TavilyClient) -> dict:
     c = company
 
-    print(f"  [1] Key facts: employees, HQ, founded...")
-    ctx_facts = serper(f"{c} pharmaceutical company number of employees headquarters founded year 2024 2025", 5)
+    print(f"  [1] Key facts: HQ, founded, industry...")
+    ctx_facts = serper(f"{c} pharmaceutical company headquarters founded year industry overview", 5)
 
     print(f"  [2] Parent organization...")
     ctx_parent = serper(f"{c} parent organization holding company owner corporate structure", 4)
@@ -79,52 +86,67 @@ def gather_all_context(company: str, tavily: TavilyClient) -> dict:
     ctx_people2 = tavily_fetch(tavily,
         f"{c} executive leadership team board of directors full name exact job title 2024 2025", 2)
 
-    print(f"  [5] Revenue {YR3}...")
+    # FIX 1: Separate dedicated employee count search targeting annual reports only
+    print(f"  [5] Employee headcount from annual report...")
+    ctx_employees = serper(
+        f"{c} total employees headcount annual report 2024 2025 \"as of\" workforce", 5)
+
+    print(f"  [6] Revenue {YR3}...")
     ctx_rev1 = serper(f"{c} full year {YR3} annual revenue sales billion results", 6)
 
-    print(f"  [6] Revenue {YR2}...")
+    print(f"  [7] Revenue {YR2}...")
     ctx_rev2 = serper(f"{c} full year {YR2} annual revenue sales billion results", 6)
 
-    print(f"  [7] Revenue {YR1}...")
+    print(f"  [8] Revenue {YR1}...")
     ctx_rev3 = serper(f"{c} full year {YR1} annual revenue sales billion results", 5)
 
-    print(f"  [8] Revenue investor relations...")
+    print(f"  [9] Revenue investor relations...")
     ctx_rev4 = tavily_fetch(tavily,
         f"{c} investor relations full year results {YR3} {YR2} {YR1} revenue annual sales", 2)
 
-    print(f"  [9] Subsidiaries...")
-    ctx_subs = serper(f"{c} subsidiaries divisions owned companies list", 5)
+    print(f"  [10] Subsidiaries — major business units...")
+    ctx_subs = serper(f"{c} major subsidiaries business units divisions acquired companies", 5)
 
-    print(f"  [10] Therapeutic areas...")
-    ctx_therapeutic = serper(f"{c} therapeutic areas disease focus portfolio oncology 2024 2025", 5)
+    print(f"  [11] Therapeutic areas...")
+    ctx_therapeutic = serper(f"{c} therapeutic areas disease focus portfolio 2024 2025", 5)
 
-    print(f"  [11] Blockbuster drugs — top selling products...")
-    ctx_bb1 = serper(f"{c} top selling drugs products 2024 2025 billion dollar sales revenue blockbuster", 6)
+    # FIX 2: Three separate blockbuster searches for better coverage
+    print(f"  [12] Blockbuster drugs — top selling products table...")
+    ctx_bb1 = serper(
+        f"{c} top products revenue 2024 annual report product sales billion branded drugs", 6)
 
-    print(f"  [12] Blockbuster drugs — recent launches...")
-    ctx_bb2 = tavily_fetch(tavily,
-        f"{c} new drug launched approved 2020 2021 2022 2023 blockbuster billion sales indication", 3)
+    print(f"  [13] Blockbuster drugs — recently crossed $1B...")
+    ctx_bb2 = serper(
+        f"{c} drug crossed 1 billion sales milestone launched 2020 2021 2022 2023 first approval year", 6)
 
-    print(f"  [13] Pipeline & approvals...")
+    print(f"  [14] Blockbuster drugs — product launch detail...")
+    ctx_bb3 = tavily_fetch(tavily,
+        f"{c} drug product launch approval year FDA EMA billion sales blockbuster 2020 2021 2022 2023 indication", 3)
+
+    print(f"  [15] Pipeline & approvals...")
     ctx_pipeline = tavily_fetch(tavily,
         f"{c} drug pipeline FDA EMA approval 2021 2022 2023 2024 2025 2026 phase III filed approved indication", 4)
 
-    print(f"  [14] Acquisitions last 2 years...")
-    ctx_acq1 = serper(f"{c} acquisition acquired deal {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} billion completed", 6)
+    print(f"  [16] Acquisitions last 2 years...")
+    ctx_acq1 = serper(
+        f"{c} acquisition acquired deal {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} billion completed", 6)
     ctx_acq2 = tavily_fetch(tavily,
         f"{c} acquisition {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR} billion deal completed strategic purpose", 3)
 
-    print(f"  [15] Partnerships & MedTech...")
-    ctx_part1 = serper(f"{c} partnership collaboration deal signed {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR}", 6)
+    print(f"  [17] Partnerships & MedTech...")
+    ctx_part1 = serper(
+        f"{c} pharmaceutical partnership collaboration deal signed {CURRENT_YEAR-2} {CURRENT_YEAR-1} {CURRENT_YEAR}", 6)
     ctx_part2 = tavily_fetch(tavily,
         f"{c} partnership collaboration AI diagnostics digital health innovation {CURRENT_YEAR-2} {CURRENT_YEAR}", 3)
-    ctx_medtech = serper(f"{c} AI artificial intelligence digital health diagnostics innovation technology {CURRENT_YEAR-4} {CURRENT_YEAR}", 5)
+    ctx_medtech = serper(
+        f"{c} AI artificial intelligence digital health diagnostics innovation technology {CURRENT_YEAR-4} {CURRENT_YEAR}", 5)
 
     return {
         "facts":       ctx_facts,
         "parent":      ctx_parent,
         "people":      ctx_people,
         "people2":     ctx_people2,
+        "employees":   ctx_employees,
         "rev1":        ctx_rev1,
         "rev2":        ctx_rev2,
         "rev3":        ctx_rev3,
@@ -133,6 +155,7 @@ def gather_all_context(company: str, tavily: TavilyClient) -> dict:
         "therapeutic": ctx_therapeutic,
         "bb1":         ctx_bb1,
         "bb2":         ctx_bb2,
+        "bb3":         ctx_bb3,
         "pipeline":    ctx_pipeline,
         "acq1":        ctx_acq1,
         "acq2":        ctx_acq2,
@@ -143,7 +166,7 @@ def gather_all_context(company: str, tavily: TavilyClient) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPRESS — 8B model. Generic instructions, no company-specific hints.
+# COMPRESS — 8B model
 # ─────────────────────────────────────────────────────────────────────────────
 
 COMPRESS_SYS = (
@@ -186,16 +209,24 @@ def compress_all(client: Groq, company: str, ctx: dict) -> dict:
         f"1. Full official company name\n"
         f"2. Year founded\n"
         f"3. Headquarters city and country\n"
-        f"4. EXACT employee headcount — find a specific number like '89,900' or '103,249'. "
-        f"Write only the exact number. If you see a range or approximation, write the number as stated.\n"
-        f"5. Parent or holding company name\n"
-        f"6. Industry classification\n"
-        f"7. Number of countries the company operates in\n"
-        f"8. EXECUTIVES: For every executive mentioned, write their FULL first and last name "
-        f"and their EXACT job title as stated in the text. "
-        f"Format: FULL NAME | EXACT TITLE\n"
-        f"If employee count not found anywhere, write: EMPLOYEES: NOT FOUND",
-        max_tokens=700)
+        f"4. Parent or holding company name\n"
+        f"5. Industry classification\n"
+        f"6. Number of countries the company operates in\n"
+        f"7. EXECUTIVES: For every executive mentioned, write FULL first+last name "
+        f"and their EXACT job title. Format: FULL NAME | EXACT TITLE",
+        max_tokens=600)
+
+    # FIX 1: Employees in a separate compress call using annual report data
+    print("  [compress 1b/7] Employee headcount...")
+    c_employees = compress(client, ctx["employees"],
+        f"From this text about {c}, find the TOTAL employee headcount.\n"
+        f"Rules:\n"
+        f"- Use the figure from an annual report or 10-K filing, NOT from a layoff/restructuring article\n"
+        f"- Look for phrases like 'approximately X,XXX employees', 'X,XXX full-time employees as of'\n"
+        f"- Write the single most accurate number you find, e.g. '128,000' or '89,900'\n"
+        f"- If only a restructuring/job cut number is found, ignore it and write: NOT FOUND\n"
+        f"- Do not add numbers together. Write only one final headcount figure.",
+        max_tokens=100)
 
     print("  [compress 2/7] Revenue...")
     combined_rev = (ctx["rev1"] + "\n\n===\n\n" + ctx["rev2"] +
@@ -214,16 +245,20 @@ def compress_all(client: Groq, company: str, ctx: dict) -> dict:
     print("  [compress 3/7] Subsidiaries & therapeutic areas...")
     c_biz = compress(client, ctx["subs"] + "\n\n===\n\n" + ctx["therapeutic"],
         f"From this text about {c}, extract:\n"
-        f"1. ALL subsidiary companies and divisions mentioned\n"
+        f"1. Major subsidiary companies and acquired business units (not regional legal entities)\n"
         f"2. ALL therapeutic areas and disease categories listed\n"
         f"3. Core business segments\n"
         f"4. Key scientific or strategic differentiator",
         max_tokens=400)
 
+    # FIX 2: Blockbuster compress now uses 3 combined sources + explicit warning
     print("  [compress 4/7] Blockbuster drugs...")
-    c_bb = compress(client, ctx["bb1"] + "\n\n===\n\n" + ctx["bb2"],
-        f"From this text about {c}, list every drug that has achieved blockbuster status "
+    c_bb = compress(client,
+        ctx["bb1"] + "\n\n===\n\n" + ctx["bb2"] + "\n\n===\n\n" + ctx["bb3"],
+        f"From this text about {c}, list drugs made BY {c} that have achieved blockbuster status "
         f"(annual sales exceeding $1 billion USD).\n"
+        f"CRITICAL: Only include drugs manufactured/sold by {c} itself. "
+        f"Do NOT include drugs from other companies even if mentioned in the same text.\n"
         f"For each drug found, extract:\n"
         f"- Brand name\n"
         f"- Year first approved or launched (FDA or EMA first approval year)\n"
@@ -231,8 +266,8 @@ def compress_all(client: Groq, company: str, ctx: dict) -> dict:
         f"- Annual sales figure if mentioned\n"
         f"Format each as: DRUG NAME | LAUNCH YEAR | DISEASE | SALES\n"
         f"If launch year is not in text, write YEAR: UNKNOWN\n"
-        f"Include ALL drugs mentioned, even if some details are missing.",
-        max_tokens=500)
+        f"Include ALL {c} drugs mentioned with >$1B sales.",
+        max_tokens=600)
 
     print("  [compress 5/7] Pipeline...")
     c_pipeline = compress(client, ctx["pipeline"],
@@ -257,6 +292,9 @@ def compress_all(client: Groq, company: str, ctx: dict) -> dict:
         ctx["part1"] + "\n\n===\n\n" + ctx["part2"] + "\n\n===\n\n" + ctx["medtech"],
         f"From this text about {c}, extract:\n\n"
         f"PARTNERSHIPS (only {CURRENT_YEAR-2}–{CURRENT_YEAR}):\n"
+        f"Include ONLY pharmaceutical/biotech/technology partnerships relevant to drug development, "
+        f"diagnostics, AI, or healthcare. EXCLUDE sports sponsorships, celebrity deals, "
+        f"or unrelated commercial partnerships.\n"
         f"For each: partner name | month+year announced | deal value | what the partnership covers\n"
         f"Exclude any partnerships before {CURRENT_YEAR-2}.\n\n"
         f"MEDTECH/AI/INNOVATION (last 5 years, {CURRENT_YEAR-5}–{CURRENT_YEAR}):\n"
@@ -265,18 +303,19 @@ def compress_all(client: Groq, company: str, ctx: dict) -> dict:
         max_tokens=500)
 
     return {
-        "facts":    c_facts,
-        "revenue":  c_revenue,
-        "biz":      c_biz,
-        "bb":       c_bb,
-        "pipeline": c_pipeline,
-        "acq":      c_acq,
-        "partner":  c_partner,
+        "facts":     c_facts,
+        "employees": c_employees,
+        "revenue":   c_revenue,
+        "biz":       c_biz,
+        "bb":        c_bb,
+        "pipeline":  c_pipeline,
+        "acq":       c_acq,
+        "partner":   c_partner,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACT — 70B model, 3 focused JSON calls. No hardcoded company references.
+# EXTRACT — 70B model, 3 focused JSON calls
 # ─────────────────────────────────────────────────────────────────────────────
 
 EXTRACT_SYS = (
@@ -326,6 +365,9 @@ Do NOT use any prior knowledge about this company.
 KEY FACTS & EXECUTIVES:
 {c['facts']}
 
+EMPLOYEE COUNT:
+{c['employees']}
+
 REVENUE:
 {c['revenue']}
 
@@ -338,12 +380,12 @@ Return ONLY this JSON:
   "founded": "Year as stated in facts",
   "parent_organization": "Parent/holding company as stated in facts, or Independent if none",
   "headquarters": "City, Country as stated",
-  "num_employees": "Exact number from facts — null if NOT FOUND",
+  "num_employees": "Exact number from EMPLOYEE COUNT section — null if NOT FOUND",
   "industry": "As stated in facts",
   "key_people": [{{"name": "Full first and last name", "role": "Exact title as stated"}}],
   "business_description": "2-3 sentences using only what is in the facts: number of countries operated in, core business segments, one scientific or strategic differentiator. No drug names, no revenue figures, no subsidiary names.",
   "therapeutic_areas": ["every therapeutic area listed in facts"],
-  "subsidiaries": ["every subsidiary listed in facts"],
+  "subsidiaries": ["every major subsidiary/business unit listed in facts — exclude regional legal entities"],
   "revenue_usd_billions": {{"{YR1}": null, "{YR2}": null, "{YR3}": null}},
   "revenue_cagr_3yr_pct": null
 }}
@@ -362,7 +404,7 @@ def prompt2(company, c):
     return f"""Build drugs JSON for "{company}" using ONLY the facts below.
 Do NOT use any prior knowledge about this company's drugs.
 
-BLOCKBUSTER DRUGS:
+BLOCKBUSTER DRUGS (drugs made by {company} only):
 {c['bb']}
 
 PIPELINE & APPROVALS:
@@ -378,9 +420,10 @@ Return ONLY this JSON:
   ]
 }}
 Rules:
-- blockbuster_drugs_last_5yr: ONLY include drugs that BOTH (a) appear in the facts above AND
-  (b) have >$1B annual sales. Launch years must be from the facts — do not guess.
-  Only include entries where you have drug name + launch year + disease from the facts.
+- blockbuster_drugs_last_5yr: ONLY drugs made by {company} that appear in the facts above with >$1B sales.
+  Launch year {yr5}–{CURRENT_YEAR} preferred but include older drugs if they are confirmed {company} products.
+  Do NOT include drugs from other companies.
+  Only include entries where you have: drug name + year + disease. Skip if year is UNKNOWN.
 - pipeline_approvals_last_5yr: only events from {yr5} to {CURRENT_YEAR}.
   Prioritise approved drugs and Phase III candidates.
 Return ONLY JSON."""
@@ -413,6 +456,7 @@ Return ONLY this JSON:
 Rules:
 - acquisitions_last_2yr: ONLY deals from {yr2} to {CURRENT_YEAR}. Hard exclude anything earlier. No duplicates.
 - partnerships_last_2yr: ONLY from {yr2} to {CURRENT_YEAR}. No duplicates.
+  ONLY include pharma/biotech/technology partnerships. Exclude sports, celebrity, or unrelated deals.
 - medtech_innovation_last_5yr: {yr5} to {CURRENT_YEAR} only. AI / diagnostics / digital health only.
 - Include ONLY what appears in the facts above. Do not add deals from memory.
 Return ONLY JSON."""
